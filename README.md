@@ -1,70 +1,43 @@
 # IIQ_3rd_helper
 
-A JavaScript utility for distributing user IDs evenly across database partitions. It automatically detects data skew, subdivides large categories, and generates SQL `WHERE` clauses for each partition.
+SailPoint IdentityIQ / ISC 운영 지원 유틸리티 모음입니다.
 
-## What it does
+## 도구 목록
 
-Given a list of user IDs and a target partition count, `normalizePartitionsAutoSplit()` returns one SQL filter per partition — ready to use in a `WHERE` clause or partition definition.
+### 1. ShinNormalizer (`ShinNormalizer/`)
 
-**Example output:**
-```json
-[
-  {
-    "partition_name": "PARTITION_1",
-    "estimated_rows": 1402,
-    "query": "(\n    USER_ID LIKE 'A1%'\n    OR USER_ID LIKE 'A2%'\n)"
-  },
-  {
-    "partition_name": "PARTITION_CATCH_ALL",
-    "estimated_rows": 38,
-    "query": "(\n    USER_ID NOT LIKE '0%' AND\n    ...\n    AND USER_ID != '' AND USER_ID IS NOT NULL\n)"
-  }
-]
-```
-
-## Usage
-
-Copy `ShinNormalizer_V3_DidEverything.js` into your project and call the function directly — there are no dependencies to install.
-
-```js
-const result = normalizePartitionsAutoSplit(
-  userIds,        // string[] — raw user ID list (nulls/empty strings allowed)
-  36,             // numPartitions — target number of partitions
-  ['0','1','2','3','4','5','6','7','8','9','C'], // majorCategories — top-level prefixes
-  true            // includeNotAll — include a catch-all partition for unmatched IDs
-);
-```
-
-Each element in the returned array has:
-
-| Field | Type | Description |
-|---|---|---|
-| `partition_name` | string | e.g. `PARTITION_1`, `PARTITION_CATCH_ALL`, `PARTITION_EXCEPTION` |
-| `estimated_rows` | number | Number of input IDs assigned to this partition |
-| `query` | string | SQL condition block ready for use in a `WHERE` clause |
-
-## How it works
-
-1. **Filter** — removes null/empty entries; computes per-partition target capacity
-2. **Classify** — groups each ID by the first matching `majorCategory` prefix; unmatched IDs go to `CatchAll`
-3. **Auto-split** — any group exceeding 115% of target capacity is subdivided by appending the next character as a new prefix; repeats until no group is oversized (max depth: 10 characters)
-4. **Bin-pack** — sorts groups largest-first and assigns each to the partition with the current lowest count (greedy)
-5. **Generate SQL** — emits `USER_ID LIKE 'prefix%'` or `USER_ID = 'exact'` per group
-6. **Append special partitions** — `PARTITION_CATCH_ALL` for unclassified IDs, `PARTITION_EXCEPTION` for nulls/empty strings
-
-## Special partitions
-
-| Partition | Condition |
-|---|---|
-| `PARTITION_CATCH_ALL` | IDs that don't start with any `majorCategory` prefix (only if `includeNotAll = true` and count > 0) |
-| `PARTITION_EXCEPTION` | Null or empty-string entries from the original input |
-
-## Quick test
+대용량 USER_ID 목록을 지정한 파티션 수에 균등 분배하고 각 파티션에 대한 SQL `WHERE` 절을 자동 생성하는 Node.js 유틸리티입니다 (V10 DualBalance).
 
 ```bash
-node -e "
-$(cat ShinNormalizer_V3_DidEverything.js)
-const ids = ['A100','A200','B001','C999','','null_user'];
-console.log(JSON.stringify(normalizePartitionsAutoSplit(ids, 3, ['A','B','C']), null, 2));
-"
+# input.txt에 USER_ID를 한 줄씩 작성 후 실행
+cd ShinNormalizer
+node main_shin.js
+# → 콘솔 출력 + output.txt (탭 구분) 생성
 ```
+
+**주요 옵션:** `numPartitions`, `allowMixing`, `balanceTarget` (`row` / `user`), `granularity`, `maxDepth`
+
+자세한 내용 → [`ShinNormalizer/README.md`](ShinNormalizer/README.md)
+
+---
+
+### 2. SPT Provisioning Transaction 분석 (`Summary-SPT_PROVISIONING_TRANSACTION/`)
+
+SailPoint IdentityIQ 8.4p2의 `spt_provisioning_transaction` 테이블을 SQL 집계 + XML 파싱으로 분석하는 Python 스크립트입니다.
+
+```bash
+pip install pyodbc
+cd Summary-SPT_PROVISIONING_TRANSACTION
+python analyze_provisioning_transactions.py --start 2024-01-01 --end 2024-12-31
+```
+
+**출력:** Application / Source / planResult / AttributeRequest op별 트랜잭션 건수
+
+자세한 내용 → [`Summary-SPT_PROVISIONING_TRANSACTION/README.md`](Summary-SPT_PROVISIONING_TRANSACTION/README.md)
+
+---
+
+## 공통 사항
+
+- 각 도구는 독립적이며 공유 빌드 시스템이나 패키지 매니저가 없습니다.
+- 소스 내 주석은 한국어로 작성되어 있습니다.
