@@ -6,9 +6,11 @@ spt_provisioning_transaction 분석 스크립트
 집계 차원
   [SQL 집계]  application / month / source → 트랜잭션 건수
   [XML 분석]  application / month / source / planResult → 트랜잭션 건수
-              application / month / source / AttributeRequest.op → entitlement 건수
+              application / month / source / op / planResult → entitlement 건수
                 (request plan: 요청된 entitlement 수)
                 (filtered plan: 필터링된 entitlement 수)
+              application / month / source / op / planResult → 사용자별 unique entitlement 합산
+                (request plan: AccountRequest.nativeIdentity별 중복 제거 후 합산)
 
 created 컬럼은 Unix timestamp(ms, BIGINT) → BETWEEN으로 기간 필터
 
@@ -150,17 +152,18 @@ def _strip_doctype(xml_str: str) -> str:
 
 def parse_attributes(xml_str: str) -> dict:
     """
-    SailPoint Attributes XML → {request, filtered, planResult, parse_error}
+    SailPoint Attributes XML → {request, request_accounts, filtered, planResult, parse_error}
 
     <Attributes><Map>
-      <entry key="request">   <value><ProvisioningPlan>...</ProvisioningPlan></value></entry>
-      <entry key="filtered">  <value><ProvisioningPlan>...</ProvisioningPlan></value></entry>
+      <entry key="request">   <value><AccountRequest nativeIdentity="..." ...>...</AccountRequest></value></entry>
+      <entry key="filtered">  <value><AccountRequest nativeIdentity="..." ...>...</AccountRequest></value></entry>
       <entry key="planResult"><value><ProvisioningResult status="..."/></value></entry>
     </Map></Attributes>
 
     Map entry 내부의 <value> 태그는 소문자.
+    request_accounts: <value>의 직접 자식 AccountRequest 전체 목록 (nativeIdentity 기반 사용자 식별용)
     """
-    result: dict = {"request": None, "filtered": None, "planResult": None, "parse_error": None}
+    result: dict = {"request": None, "request_accounts": [], "filtered": None, "planResult": None, "parse_error": None}
     if not xml_str or not xml_str.strip():
         return result
     try:
@@ -173,6 +176,8 @@ def parse_attributes(xml_str: str) -> dict:
                     children = list(val_elem)
                     if children:
                         result[key] = children[0]
+                        if key == "request":
+                            result["request_accounts"] = children
     except ET.ParseError as exc:
         result["parse_error"] = str(exc)
     return result
@@ -217,9 +222,36 @@ def _count_attr_request_values(ar_elem) -> int:
     return 1
 
 
+def _get_attr_request_values(ar_elem) -> list:
+    """
+    AttributeRequest 하나의 value 문자열 목록 반환 (unique 집계용).
+
+    SailPoint IIQ XML 직렬화 형태:
+      1) 인라인 속성  → <AttributeRequest value="CN=..." .../>        → ["CN=..."]
+      2) 단일 엘리먼트 → <AttributeRequest><Value>CN=...</Value>...    → ["CN=..."]
+      3) List        → <AttributeRequest>
+                         <Value><List>
+                           <String>CN=G1</String>
+                           <String>CN=G2</String>
+                         </List></Value>                               → ["CN=G1", "CN=G2"]
+      값 없는 op (Unlock, Enable 등) → ["(no_value)"]
+    """
+    inline = ar_elem.get("value")
+    if inline is not None:
+        return [inline]
+    val_elem = ar_elem.find("Value")
+    if val_elem is None:
+        return ["(no_value)"]
+    list_elem = val_elem.find("List")
+    if list_elem is not None:
+        strings = [s.text or "" for s in list_elem.findall("String")]
+        return strings if strings else ["(empty_list)"]
+    return [val_elem.text or "(empty)"]
+
+
 def get_entitlements_by_op(plan_elem) -> dict:
     """
-    ProvisioningPlan에서 AttributeRequest.op별 entitlement value 건수 반환.
+    AccountRequest에서 AttributeRequest.op별 entitlement value 건수 반환.
 
     Returns: {op: count}
       op 예시: 'Add', 'Remove', 'Set', 'Retain' 등
@@ -294,16 +326,18 @@ def print_subtotals_by_source(rows: list):
 
 # ─── XML 집계 ─────────────────────────────────────────────────────────────────
 def accumulate_xml_stats(chunk,
-                         tx_agg:          dict,
-                         req_ent_agg:     dict,
+                         tx_agg:           dict,
+                         req_ent_agg:      dict,
                          filtered_ent_agg: dict,
-                         counters:        dict):
+                         unique_req_agg:   dict,
+                         counters:         dict):
     """
     fetchmany() 청크를 받아 집계 dict에 누적.
 
     tx_agg           : {(app, month, src, planResult_status): tx_count}
-    req_ent_agg      : {(app, month, src, attr_op): entitlement_count}
-    filtered_ent_agg : {(app, month, src, attr_op): entitlement_count}
+    req_ent_agg      : {(app, month, src, attr_op, planResult): entitlement_count}
+    filtered_ent_agg : {(app, month, src, attr_op, planResult): entitlement_count}
+    unique_req_agg   : {(app, month, src, attr_op, planResult): {nativeIdentity: set(values)}}
     counters         : processed / parse_errors / no_attr
     """
     for row in chunk:
@@ -338,15 +372,27 @@ def accumulate_xml_stats(chunk,
         for op, cnt in get_entitlements_by_op(parsed["filtered"]).items():
             filtered_ent_agg[(*dim3, op, ps)] += cnt
 
+        # request plan: nativeIdentity별 unique entitlement 합산
+        for ar in parsed["request_accounts"]:
+            native_id = ar.get("nativeIdentity", "(unknown)")
+            for attr_req in ar.findall("AttributeRequest"):
+                op = attr_req.get("op", "unknown")
+                key = (*dim3, op, ps)
+                if key not in unique_req_agg:
+                    unique_req_agg[key] = defaultdict(set)
+                for val in _get_attr_request_values(attr_req):
+                    unique_req_agg[key][native_id].add(val)
+
         counters["processed"] += 1
 
 
 # ─── XML 출력 ─────────────────────────────────────────────────────────────────
-def print_xml_results(tx_agg:          dict,
-                      req_ent_agg:     dict,
+def print_xml_results(tx_agg:           dict,
+                      req_ent_agg:      dict,
                       filtered_ent_agg: dict,
-                      counters:        dict,
-                      total_fetched:   int):
+                      unique_req_agg:   dict,
+                      counters:         dict,
+                      total_fetched:    int):
 
     col_app   = 30
     col_month = 9
@@ -441,6 +487,45 @@ def print_xml_results(tx_agg:          dict,
         print(f"  {'TOTAL':<{col_op}} {fmt(req_total):>{col_num}} {fmt(filtered_total):>{col_num}}")
         sep()
 
+    # ── 사용자별 중복 제거 request entitlement 건수 ──────────────────────────────
+    if unique_req_agg:
+        unique_total = sum(
+            len(vs) for uid_map in unique_req_agg.values() for vs in uid_map.values()
+        )
+
+        header("■ Entitlement 건수 — 사용자별 중복 제거 합산  (Application / 월 / Source / op / planResult)")
+        print(
+            f"  {'Application':<{col_app}} {'Month':<{col_month}} {'Source':<{col_src}}"
+            f" {'op':<{col_op}} {'planResult':<{col_pr}} {'UniqueReq':>{col_num}}"
+        )
+        sep()
+        for key in sorted(unique_req_agg.keys()):
+            app, month, src, op, ps = key
+            cnt = sum(len(vs) for vs in unique_req_agg[key].values())
+            print(
+                f"  {app:<{col_app}} {month:<{col_month}} {src:<{col_src}}"
+                f" {op:<{col_op}} {ps:<{col_pr}} {fmt(cnt):>{col_num}}"
+            )
+        sep()
+        elw2 = col_app + col_month + col_src + col_op + col_pr + 4
+        print(f"  {'TOTAL':<{elw2}} {fmt(unique_total):>{col_num}}")
+        sep()
+
+        # op 소계
+        op_unique: dict = defaultdict(int)
+        for (_, _, _, op, _), uid_map in unique_req_agg.items():
+            op_unique[op] += sum(len(vs) for vs in uid_map.values())
+        all_ops_unique = sorted(op_unique.keys())
+
+        print(f"\n  [op 소계]")
+        print(f"  {'op':<{col_op}} {'UniqueReq':>{col_num}}")
+        sep()
+        for op in all_ops_unique:
+            print(f"  {op:<{col_op}} {fmt(op_unique[op]):>{col_num}}")
+        sep()
+        print(f"  {'TOTAL':<{col_op}} {fmt(unique_total):>{col_num}}")
+        sep()
+
 
 # ─── 메인 ─────────────────────────────────────────────────────────────────────
 def main():
@@ -495,6 +580,7 @@ def main():
     tx_agg:           dict = defaultdict(int)
     req_ent_agg:      dict = defaultdict(int)
     filtered_ent_agg: dict = defaultdict(int)
+    unique_req_agg:   dict = {}
     counters = {"processed": 0, "parse_errors": 0, "no_attr": 0}
     total_fetched = 0
 
@@ -510,7 +596,7 @@ def main():
 
         total_fetched += len(chunk)
         print(f"\r  fetch 중... {total_fetched:,}건", end="", flush=True)
-        accumulate_xml_stats(chunk, tx_agg, req_ent_agg, filtered_ent_agg, counters)
+        accumulate_xml_stats(chunk, tx_agg, req_ent_agg, filtered_ent_agg, unique_req_agg, counters)
 
     print(f"\r  fetch 완료: {total_fetched:,}건  "
           f"(처리: {counters['processed']}  "
@@ -523,7 +609,7 @@ def main():
     if total_fetched == 0:
         print("  → 데이터 없음")
     else:
-        print_xml_results(tx_agg, req_ent_agg, filtered_ent_agg, counters, total_fetched)
+        print_xml_results(tx_agg, req_ent_agg, filtered_ent_agg, unique_req_agg, counters, total_fetched)
 
     print("\n완료.")
 
